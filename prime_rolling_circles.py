@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import animation
 from matplotlib.colors import to_rgba
-from matplotlib.patches import Circle
+from matplotlib.patches import Ellipse
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +30,7 @@ MAX_NUMBER = 50
 PRIME_MODE = "auto"  # "auto" or "manual"
 MANUAL_CIRCLES = [2, 3, 5, 7, 11]
 
-ANIMATION_SPEED = 0.35
+ANIMATION_SPEED = 0.7
 SHOW_NUMBER_LABELS = True
 SHOW_ALL_PREVIOUS_CIRCLES = True
 KEEP_COMPOSITES_RED = True
@@ -233,6 +233,7 @@ class FrameState:
     contact_positions: list[int]
     active_prime: int | None
     motion_mode: str
+    flip_progress: float = 0.0
 
 
 def make_snapshots(runtimes: list[CircleRuntime]) -> list[FrameCircleSnapshot]:
@@ -251,6 +252,11 @@ def make_snapshots(runtimes: list[CircleRuntime]) -> list[FrameCircleSnapshot]:
             )
         )
     return snapshots
+
+
+def get_flip_horizontal_scale(progress: float) -> float:
+    """Horizontal scale for pseudo-3D flip (1 -> thin edge -> 1)."""
+    return max(0.08, abs(math.cos(math.pi * progress)))
 
 
 class RollingCircle:
@@ -457,28 +463,14 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
                     else:
                         break
 
-        snapshots: list[FrameCircleSnapshot] = []
-        for runtime in runtimes:
-            c = runtime.circle
-            snapshots.append(
-                FrameCircleSnapshot(
-                    p=c.p,
-                    radius=c.radius,
-                    center_x=c.center_x,
-                    center_y=c.center_y,
-                    red_x=c.red_point[0],
-                    red_y=c.red_point[1],
-                    is_moving=(c.distance_traveled < c.total_distance - 1e-12),
-                )
-            )
-
         all_frames.append(
             FrameState(
-                circle_snapshots=snapshots,
+                circle_snapshots=make_snapshots(runtimes),
                 composite_flags=composite_flags.copy(),
                 contact_positions=contact_positions.copy(),
                 active_prime=active_prime,
                 motion_mode=motion_mode,
+                flip_progress=0.0,
             )
         )
 
@@ -487,6 +479,38 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
             done_discovering = next_circle_index >= len(circle_values)
             if not any_moving and done_discovering:
                 if ROLL_BACK_ENABLED and spawned_primes:
+                    flip_end_angles: dict[int, float] = {}
+                    if FLIP_FRAME_COUNT > 0:
+                        initial_flip_angles = {runtime.circle.p: runtime.circle.rotation_angle for runtime in runtimes}
+                        # Flip slowly in place before return roll.
+                        for step in range(FLIP_FRAME_COUNT):
+                            progress = (step + 1) / FLIP_FRAME_COUNT
+                            for runtime in runtimes:
+                                circle = runtime.circle
+                                base_angle = initial_flip_angles[circle.p]
+                                circle.rotation_angle = base_angle + progress * math.pi
+                                horizontal_scale = get_flip_horizontal_scale(progress)
+                                point_x = circle.center_x + (circle.radius * horizontal_scale) * math.sin(circle.rotation_angle)
+                                point_y = circle.center_y + circle.radius * math.cos(circle.rotation_angle)
+                                circle.red_point = (point_x, point_y)
+
+                            all_frames.append(
+                                FrameState(
+                                    circle_snapshots=make_snapshots(runtimes),
+                                    composite_flags=composite_flags.copy(),
+                                    contact_positions=contact_positions.copy(),
+                                    active_prime=None,
+                                    motion_mode="flip",
+                                    flip_progress=progress,
+                                )
+                            )
+
+                        for runtime in runtimes:
+                            flip_end_angles[runtime.circle.p] = runtime.circle.rotation_angle
+                    else:
+                        for runtime in runtimes:
+                            flip_end_angles[runtime.circle.p] = runtime.circle.rotation_angle
+
                     # Flip pass: re-spawn discovered circles on the right and roll back left.
                     runtimes = []
                     for p in spawned_primes:
@@ -497,8 +521,9 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
                             start_x=right_start,
                             end_x=left_end,
                             direction=-1,
-                            # Visible left-right flip: start on the opposite side.
-                            initial_angle=0.0,
+                            # Preserve each circle's post-flip phase to avoid
+                            # artificial alignment after turnaround.
+                            initial_angle=flip_end_angles.get(p, math.pi),
                             # Opposite spin progression for the return pass.
                             angular_velocity_sign=-1.0,
                         )
@@ -569,10 +594,10 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
     fig, ax = build_figure(max_radius)
     number_markers, active_prime_marker, label_artists = initialize_number_line_markers(ax, MAX_NUMBER)
 
-    circle_patches: dict[int, Circle] = {}
+    circle_patches: dict[int, Ellipse] = {}
     red_point_artists: dict[int, plt.Line2D] = {}
     for p in circle_values:
-        patch = Circle((0.0, 0.0), radius=0.0, fill=False, linewidth=1.6, edgecolor=PREVIOUS_CIRCLE_COLOR, alpha=0.7, zorder=2)
+        patch = Ellipse((0.0, 0.0), width=0.0, height=0.0, angle=0.0, fill=False, linewidth=1.6, edgecolor=PREVIOUS_CIRCLE_COLOR, alpha=0.7, zorder=2)
         patch.set_visible(False)
         ax.add_patch(patch)
         circle_patches[p] = patch
@@ -670,7 +695,16 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
                 continue
 
             patch.center = (snapshot.center_x, snapshot.center_y)
-            patch.set_radius(snapshot.radius)
+            diameter = 2.0 * snapshot.radius
+            if frame_state.motion_mode == "flip":
+                # Fake 3D turn: compress horizontal width to a thin edge at mid-flip.
+                compression = get_flip_horizontal_scale(frame_state.flip_progress)
+                width = diameter * compression
+                patch.width = width
+                patch.height = diameter
+            else:
+                patch.width = diameter
+                patch.height = diameter
             is_active = snapshot.is_moving
             if is_active:
                 patch.set_edgecolor(ACTIVE_CIRCLE_COLOR)
@@ -709,7 +743,12 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
             contact_markers.set_offsets(np.empty((0, 2)))
 
         active_count = sum(1 for s in frame_state.circle_snapshots if s.is_moving)
-        direction_label = "rightward (clockwise)" if frame_state.motion_mode == "forward" else "leftward (anticlockwise)"
+        if frame_state.motion_mode == "forward":
+            direction_label = "rightward (clockwise)"
+        elif frame_state.motion_mode == "backward":
+            direction_label = "leftward (anticlockwise)"
+        else:
+            direction_label = "flip (in place)"
         title_artist.set_text(
             f"Rolling circles on number line | active circles: {active_count} | mode: {direction_label}"
         )
