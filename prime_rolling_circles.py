@@ -25,12 +25,13 @@ from matplotlib.patches import Ellipse
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-MAX_NUMBER = 50
+MAX_NUMBER = 40
 
-PRIME_MODE = "auto"  # "auto" or "manual"
-MANUAL_CIRCLES = [2, 3, 5, 7, 11]
+PRIME_MODE = "manual"  # "auto" or "manual"
+MANUAL_CIRCLES = list(range(2, 40))
+MANUAL_START_TOGETHER = True
 
-ANIMATION_SPEED = 0.7
+ANIMATION_SPEED = 0.1
 SHOW_NUMBER_LABELS = True
 SHOW_ALL_PREVIOUS_CIRCLES = True
 KEEP_COMPOSITES_RED = True
@@ -43,6 +44,7 @@ ROLL_BACK_ENABLED = True
 SHOW_PHASE_DATA = False
 SHOW_GOLDBACH_RESULT = True
 FLIP_FRAME_COUNT = 40
+FLIP_DOT_LIFT = 0.35
 
 EXPORT_ANIMATION = False
 EXPORT_FORMAT = "mp4"  # "mp4" or "gif"
@@ -59,6 +61,7 @@ ACTIVE_PRIME_COLOR = "#d4a017"
 ACTIVE_CIRCLE_COLOR = "#1f3f5b"
 PREVIOUS_CIRCLE_COLOR = "#9fb3c8"
 CONTACT_MARK_COLOR = "#c61c1c"
+CHOSEN_NUMBER_RING_COLOR = "#f2c94c"
 INACTIVE_NUMBER_COLOR = "#bbbbbb"
 
 BASE_MARKER_SIZE = 42
@@ -104,6 +107,41 @@ def validate_configuration() -> None:
         raise ValueError("FLIP_FRAME_COUNT must be >= 0.")
 
 
+def parse_manual_circle_values(circle_values: Iterable[int | str]) -> list[int]:
+    """Parse manual circle entries.
+
+    Supports:
+    - integers: 12
+    - strings: "12"
+    - ranges: "10-16" (inclusive)
+    """
+    parsed: list[int] = []
+    for value in circle_values:
+        if isinstance(value, int):
+            parsed.append(value)
+            continue
+
+        text = str(value).strip()
+        if not text:
+            continue
+
+        if "-" in text:
+            left, right = text.split("-", 1)
+            left = left.strip()
+            right = right.strip()
+            if left.lstrip("-").isdigit() and right.lstrip("-").isdigit():
+                start = int(left)
+                end = int(right)
+                step = 1 if end >= start else -1
+                parsed.extend(list(range(start, end + step, step)))
+                continue
+
+        if text.lstrip("-").isdigit():
+            parsed.append(int(text))
+
+    return parsed
+
+
 def get_goldbach_left_primes(max_number: int) -> set[int]:
     """Return left-side primes p where p + q = 2*max_number for some prime q."""
     target = 2 * max_number
@@ -140,36 +178,28 @@ def get_mark_targets(p: int, max_number: int) -> list[int]:
     return list(range(first_multiple, max_number + 1, p))
 
 
-def get_backward_targets(p: int, start_x: float, end_x: float) -> list[int]:
-    """Return-pass targets for a folded number line Goldbach sweep.
+def get_backward_targets(p: int, max_number: int) -> list[int]:
+    """Backward contact targets under the folded-line model.
 
-    With MAX at the fold midpoint, a left-side value x maps to the right-side
-    value (2*MAX - x). For circle p, we mark x whenever (2*MAX - x) is a
-    multiple of p:
-
-        x = 2*MAX - k*p
-
-    This makes the backward pass act like sieving complements toward the target
-    even number 2*MAX.
+    Real-line interpretation: after reaching MAX, the circle keeps rolling
+    forward on [MAX, 2*MAX]. Ground contacts still happen at multiples of p.
+    Folding around MAX maps each contact x (> MAX) to (2*MAX - x) in [0, MAX].
+    These mirrored targets are consumed while the circle rolls leftward.
     """
     if p <= 0:
         return []
 
-    high = max(start_x, end_x)
-    low = min(start_x, end_x)
-    folded_sum = 2.0 * high
+    # First contact strictly after MAX on the continued line.
+    first_multiple = ((max_number + 1 + p - 1) // p) * p
+    # Last contact not beyond 2*MAX on the continued line.
+    last_multiple = ((2 * max_number) // p) * p
+    if first_multiple > last_multiple:
+        return []
 
-    targets: list[int] = []
-    k_start = max(1, int(math.floor((folded_sum - high) / p)))
-    k_end = int(math.floor((folded_sum - low) / p))
-
-    for k in range(k_start, k_end + 1):
-        value = folded_sum - k * p
-        rounded = int(round(value))
-        if abs(value - rounded) < 1e-9 and low - 1e-9 <= rounded <= high + 1e-9:
-            targets.append(rounded)
-
-    return sorted(set(targets), reverse=True)
+    mirrored_targets: list[int] = []
+    for contact_on_extended_line in range(first_multiple, last_multiple + 1, p):
+        mirrored_targets.append(2 * max_number - contact_on_extended_line)
+    return mirrored_targets
 
 
 def build_auto_circle_sequence(max_number: int) -> list[int]:
@@ -191,7 +221,7 @@ def build_auto_circle_sequence(max_number: int) -> list[int]:
 def build_manual_circle_sequence(max_number: int, circle_values: Iterable[int]) -> list[int]:
     sequence: list[int] = []
     seen: set[int] = set()
-    for value in circle_values:
+    for value in parse_manual_circle_values(circle_values):
         candidate = int(value)
         if candidate < 2 or candidate > max_number or candidate in seen:
             continue
@@ -270,6 +300,7 @@ class RollingCircle:
         direction: int = 1,
         initial_angle: float = math.pi,
         angular_velocity_sign: float = 1.0,
+        x_reflection: float = 1.0,
     ) -> None:
         self.p = int(p)
         self.radius = self.p / (2.0 * math.pi)
@@ -278,6 +309,7 @@ class RollingCircle:
         self.direction = 1 if direction >= 0 else -1
         self.initial_angle = float(initial_angle)
         self.angular_velocity_sign = float(angular_velocity_sign)
+        self.x_reflection = float(x_reflection)
 
         self.center_x = self.start_x
         self.center_y = self.radius
@@ -311,7 +343,7 @@ class RollingCircle:
         self.phase = bounded_distance % self.p
         self.angular_phase = self.rotation_angle % (2.0 * math.pi)
 
-        point_x = self.center_x + self.radius * math.sin(self.rotation_angle)
+        point_x = self.center_x + self.x_reflection * self.radius * math.sin(self.rotation_angle)
         point_y = self.center_y + self.radius * math.cos(self.rotation_angle)
         self.red_point = (point_x, point_y)
 
@@ -397,11 +429,34 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
     max_frames = max(2000, int(math.ceil(max_number / ANIMATION_SPEED)) * 30)
 
     while len(all_frames) < max_frames:
+        # In manual mode, optionally start all chosen circles together.
+        if PRIME_MODE == "manual" and MANUAL_START_TOGETHER and next_circle_index == 0:
+            for candidate in circle_values:
+                start_x = start_lookup[candidate]
+                runtimes.append(
+                    CircleRuntime(
+                        circle=RollingCircle(
+                            p=candidate,
+                            start_x=start_x,
+                            end_x=float(max_number),
+                            direction=1,
+                            initial_angle=math.pi,
+                            angular_velocity_sign=1.0,
+                        ),
+                        forward_targets=targets_lookup[candidate],
+                        backward_targets=[],
+                        next_forward_target_index=0,
+                        next_backward_target_index=0,
+                    )
+                )
+                spawned_primes.append(candidate)
+            next_circle_index = len(circle_values)
+
         while motion_mode == "forward" and next_circle_index < len(circle_values):
             candidate = circle_values[next_circle_index]
             if candidate > int(math.floor(global_sweep_x + 1e-9)):
                 break
-            if not composite_flags[candidate]:
+            if PRIME_MODE == "manual" or not composite_flags[candidate]:
                 start_x = start_lookup[candidate]
                 runtimes.append(
                     CircleRuntime(
@@ -441,10 +496,12 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
                     target = runtime.forward_targets[runtime.next_forward_target_index]
                     contact_distance = abs(target - circle.start_x)
                     if contact_distance <= circle.distance_traveled + 1e-9:
-                        composite_flags[target] = True
-                        if target not in contact_seen:
-                            contact_seen.add(target)
-                            contact_positions.append(target)
+                        # Never mark a circle's own number.
+                        if target != circle.p:
+                            composite_flags[target] = True
+                            if target not in contact_seen:
+                                contact_seen.add(target)
+                                contact_positions.append(target)
                         runtime.next_forward_target_index += 1
                     else:
                         break
@@ -453,12 +510,11 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
                     target = runtime.backward_targets[runtime.next_backward_target_index]
                     contact_distance = abs(target - circle.start_x)
                     if contact_distance <= circle.distance_traveled + 1e-9:
-                        # Keep prime self-protection rule during return pass too.
-                        if target != circle.p:
-                            composite_flags[target] = True
-                            if target not in contact_seen:
-                                contact_seen.add(target)
-                                contact_positions.append(target)
+                        # Backward pass may mark the circle's own value.
+                        composite_flags[target] = True
+                        if target not in contact_seen:
+                            contact_seen.add(target)
+                            contact_positions.append(target)
                         runtime.next_backward_target_index += 1
                     else:
                         break
@@ -479,7 +535,13 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
             done_discovering = next_circle_index >= len(circle_values)
             if not any_moving and done_discovering:
                 if ROLL_BACK_ENABLED and spawned_primes:
-                    flip_end_angles: dict[int, float] = {}
+                    # Capture the forward-end angle BEFORE the flip animation.
+                    # Backward motion mirrors a continued rightward roll on
+                    # [MAX, 2*MAX] back into [0, MAX].
+                    pre_flip_angles: dict[int, float] = {
+                        runtime.circle.p: runtime.circle.rotation_angle
+                        for runtime in runtimes
+                    }
                     if FLIP_FRAME_COUNT > 0:
                         initial_flip_angles = {runtime.circle.p: runtime.circle.rotation_angle for runtime in runtimes}
                         # Flip slowly in place before return roll.
@@ -488,10 +550,19 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
                             for runtime in runtimes:
                                 circle = runtime.circle
                                 base_angle = initial_flip_angles[circle.p]
-                                circle.rotation_angle = base_angle + progress * math.pi
-                                horizontal_scale = get_flip_horizontal_scale(progress)
-                                point_x = circle.center_x + (circle.radius * horizontal_scale) * math.sin(circle.rotation_angle)
-                                point_y = circle.center_y + circle.radius * math.cos(circle.rotation_angle)
+                                # Keep rotational phase continuous and mirror
+                                # the x-offset through the flip. Add a slight
+                                # upward arc so the dot does not appear to make
+                                # fake ground contacts while turning in place.
+                                circle.rotation_angle = base_angle
+                                mirror_factor = math.cos(math.pi * progress)
+                                lift_factor = abs(math.sin(math.pi * progress))
+                                point_x = circle.center_x + (circle.radius * mirror_factor) * math.sin(circle.rotation_angle)
+                                point_y = (
+                                    circle.center_y
+                                    + circle.radius * math.cos(circle.rotation_angle)
+                                    + circle.radius * FLIP_DOT_LIFT * lift_factor
+                                )
                                 circle.red_point = (point_x, point_y)
 
                             all_frames.append(
@@ -505,12 +576,6 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
                                 )
                             )
 
-                        for runtime in runtimes:
-                            flip_end_angles[runtime.circle.p] = runtime.circle.rotation_angle
-                    else:
-                        for runtime in runtimes:
-                            flip_end_angles[runtime.circle.p] = runtime.circle.rotation_angle
-
                     # Flip pass: re-spawn discovered circles on the right and roll back left.
                     runtimes = []
                     for p in spawned_primes:
@@ -521,17 +586,17 @@ def build_simulation_frames(circle_values: list[int], max_number: int) -> list[F
                             start_x=right_start,
                             end_x=left_end,
                             direction=-1,
-                            # Preserve each circle's post-flip phase to avoid
-                            # artificial alignment after turnaround.
-                            initial_angle=flip_end_angles.get(p, math.pi),
-                            # Opposite spin progression for the return pass.
-                            angular_velocity_sign=-1.0,
+                            # Exact mirror of continued rightward rolling:
+                            # x_back(d) = 2*MAX - x_forward(MAX+d).
+                            initial_angle=pre_flip_angles.get(p, math.pi),
+                            angular_velocity_sign=1.0,
+                            x_reflection=-1.0,
                         )
                         runtimes.append(
                             CircleRuntime(
                                 circle=backward_circle,
                                 forward_targets=[],
-                                backward_targets=get_backward_targets(p, right_start, left_end),
+                                backward_targets=get_backward_targets(p, max_number),
                                 next_forward_target_index=0,
                                 next_backward_target_index=0,
                             )
@@ -587,12 +652,23 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
         raise ValueError("No circles were generated. Check PRIME_MODE and MANUAL_CIRCLES.")
 
     goldbach_left_primes = get_goldbach_left_primes(MAX_NUMBER)
+    use_goldbach_result = SHOW_GOLDBACH_RESULT and PRIME_MODE == "auto"
 
     simulation_frames = build_simulation_frames(circle_values, MAX_NUMBER)
     max_radius = max(p / (2.0 * math.pi) for p in circle_values)
 
     fig, ax = build_figure(max_radius)
     number_markers, active_prime_marker, label_artists = initialize_number_line_markers(ax, MAX_NUMBER)
+
+    chosen_number_rings = ax.scatter(
+        np.array(circle_values, dtype=float),
+        np.zeros(len(circle_values), dtype=float),
+        s=ACTIVE_MARKER_SIZE * 1.25,
+        facecolors="none",
+        edgecolors=CHOSEN_NUMBER_RING_COLOR,
+        linewidths=2.0,
+        zorder=4.5,
+    )
 
     circle_patches: dict[int, Ellipse] = {}
     red_point_artists: dict[int, plt.Line2D] = {}
@@ -639,6 +715,7 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
         return [
             number_markers,
             active_prime_marker,
+            chosen_number_rings,
             contact_markers,
             title_artist,
             info_artist,
@@ -654,7 +731,7 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
         visible_composites = frame_state.composite_flags if KEEP_COMPOSITES_RED else np.zeros(MAX_NUMBER + 1, dtype=bool)
 
         is_last_frame = frame_index == len(simulation_frames) - 1
-        if SHOW_GOLDBACH_RESULT and is_last_frame:
+        if use_goldbach_result and is_last_frame:
             # Final frame: show only Goldbach-valid left primes as blue.
             visible_composites = np.ones(MAX_NUMBER + 1, dtype=bool)
             visible_composites[0] = False
@@ -772,7 +849,7 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
         else:
             phase_artist.set_text("")
 
-        if SHOW_GOLDBACH_RESULT and is_last_frame:
+        if use_goldbach_result and is_last_frame:
             target = 2 * MAX_NUMBER
             title_artist.set_text(
                 f"Goldbach target {target}: left-side pair primes = {len(goldbach_left_primes)}"
@@ -780,6 +857,10 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
             status_artist.set_text(
                 "Blue points are primes p such that p + q = 2*MAX_NUMBER with q prime"
             )
+
+        if PRIME_MODE == "manual" and is_last_frame:
+            title_artist.set_text("Manual circle mode: final phase frozen")
+            status_artist.set_text("Final frame keeps each circle phase as-is (no Goldbach override)")
 
         # Placeholder for future roll-back support. The class already stores
         # direction, so a return path can later be added by extending timeline
@@ -790,6 +871,7 @@ def create_animation() -> tuple[plt.Figure, animation.FuncAnimation]:
         return [
             number_markers,
             active_prime_marker,
+            chosen_number_rings,
             contact_markers,
             title_artist,
             info_artist,
