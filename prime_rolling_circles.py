@@ -27,7 +27,7 @@ from matplotlib.patches import Ellipse
 # ---------------------------------------------------------------------------
 MAX_NUMBER = 40
 
-PRIME_MODE = "manual"  # "auto" or "manual"
+PRIME_MODE = "auto"  # "auto" or "manual"
 MANUAL_CIRCLES = list(range(2, 40))
 MANUAL_START_TOGETHER = True
 
